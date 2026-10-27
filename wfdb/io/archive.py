@@ -3,18 +3,22 @@ Support for .wfdb archive files.
 
 A .wfdb archive is a ZIP file containing the files of a single WFDB
 record: its header file, the signal files listed in the header, and
-optionally annotation files.
+optionally annotation files. The archive of a multi-segment record also
+contains the header and signal files of its segments.
 Header files are compressed, while signal files are stored without
 compression so that a range of samples can be read without
 decompressing the whole file.
 """
 
+import hashlib
 import os
 import stat
 import tempfile
 import weakref
 import zipfile
 from contextlib import contextmanager
+
+from wfdb.io import header
 
 ARCHIVE_EXTENSION = ".wfdb"
 
@@ -34,9 +38,11 @@ class WFDBArchive:
     The new archive gets the permissions of the archive it replaces, or
     the default permissions for new files.
 
-    An archive holds a single record, so only one header file can be
-    written to it. Annotation files and other files can be added
-    alongside the record's header and signal files.
+    An archive holds a single record. It can contain several header
+    files only if the record is a multi-segment record: then the other
+    headers must be the segments (or layout header) listed in the main
+    header. This is checked when the archive is closed. Annotation files
+    and other files can be added alongside the record's files.
 
     Use the object as a context manager so that it is always closed. An
     archive in write mode that is discarded without being closed is not
@@ -69,6 +75,10 @@ class WFDBArchive:
         self.path = path
         self.mode = mode
         self._tmp_path = None
+        # In write mode: the content of the header files written, and a
+        # digest of every file written
+        self._headers = {}
+        self._digests = {}
 
         if mode == "r":
             if not os.path.isfile(path):
@@ -141,12 +151,13 @@ class WFDBArchive:
 
     def header_file_name(self):
         """
-        Find the header file of the record in the archive.
+        Find the main header file of the record in the archive.
 
         The header is expected to be named after the archive (for
         example 'record.hea' in 'record.wfdb'). If there is no such
-        file but the archive contains exactly one header file, that
-        file is used.
+        file, the header used is the only header file in the archive,
+        or, for a multi-segment record, the header that lists all the
+        other headers as its segments.
 
         Returns
         -------
@@ -155,24 +166,34 @@ class WFDBArchive:
 
         """
         file_name = self.record_name + ".hea"
-        if not self.exists(file_name):
-            headers = [n for n in self.namelist() if n.endswith(".hea")]
-            if len(headers) != 1:
-                raise FileNotFoundError(
-                    f"Could not find '{file_name}' in archive '{self.path}'"
-                    + (
-                        f" (it contains several header files: {headers})"
-                        if headers
-                        else ""
-                    )
-                )
-            file_name = headers[0]
-        return file_name
+        if self.exists(file_name):
+            return file_name
 
-    def read_header(self):
+        headers = [n for n in self.namelist() if n.endswith(".hea")]
+        if len(headers) == 1:
+            return headers[0]
+        main_header = None
+        if headers:
+            main_header = _main_header(
+                {name: self._read_header_file(name) for name in headers}
+            )
+        if main_header is None:
+            raise FileNotFoundError(
+                f"Could not find '{file_name}' in archive '{self.path}'"
+                + (f" (it contains several header files: {headers})" if headers else "")
+            )
+        return main_header
+
+    def read_header(self, record_name=None):
         """
-        Return the content of the record's header file. See
-        `header_file_name` for how the header file is found.
+        Return the content of a header file in the archive.
+
+        Parameters
+        ----------
+        record_name : str, optional
+            The name of the record (or segment) whose header to read. By
+            default, the main header of the archive's record is read; see
+            `header_file_name` for how it is found.
 
         Returns
         -------
@@ -180,7 +201,16 @@ class WFDBArchive:
             The content of the header file.
 
         """
-        file_name = self.header_file_name()
+        if record_name is None:
+            file_name = self.header_file_name()
+        else:
+            file_name = record_name + ".hea"
+        return self._read_header_file(file_name)
+
+    def _read_header_file(self, file_name):
+        """
+        Read a header file from the archive, refusing very large files.
+        """
         if self.file_size(file_name) > MAX_HEADER_SIZE:
             raise ValueError(
                 f"Header file '{file_name}' in archive '{self.path}' is "
@@ -200,6 +230,10 @@ class WFDBArchive:
         """
         Add a file to an archive opened for writing.
 
+        Writing a file that is already in the archive is allowed only if
+        the content is the same (segments of a multi-segment record can
+        share a signal file), and then the file is not written again.
+
         Parameters
         ----------
         file_name : str
@@ -208,12 +242,20 @@ class WFDBArchive:
             The content of the file.
 
         """
-        self._check_new_file(file_name)
-        self._zipfile.writestr(file_name, data, compress_type=_compress_type(file_name))
+        self._require_mode("w")
+        data = bytes(data)
+        if self._register_file(file_name, hashlib.sha256(data).digest()):
+            if file_name.endswith(".hea"):
+                self._headers[file_name] = data.decode("ascii", errors="ignore")
+            self._zipfile.writestr(
+                file_name, data, compress_type=_compress_type(file_name)
+            )
 
     def add_file(self, path):
         """
-        Copy a file from disk into an archive opened for writing.
+        Copy a file from disk into an archive opened for writing. As with
+        `write`, a file that is already in the archive is only allowed if
+        the content is the same.
 
         Parameters
         ----------
@@ -221,27 +263,34 @@ class WFDBArchive:
             The path of the file. It is stored under its base name.
 
         """
+        self._require_mode("w")
         file_name = os.path.basename(path)
-        self._check_new_file(file_name)
-        self._zipfile.write(
-            path, arcname=file_name, compress_type=_compress_type(file_name)
-        )
+        if self._register_file(file_name, _file_digest(path)):
+            if file_name.endswith(".hea"):
+                with open(path, encoding="ascii", errors="ignore") as f:
+                    self._headers[file_name] = f.read()
+            self._zipfile.write(
+                path, arcname=file_name, compress_type=_compress_type(file_name)
+            )
 
     def close(self):
         """
-        Close the archive. In write mode, this moves the new archive into
-        place.
+        Close the archive. In write mode, this checks that the archive
+        holds a single record, and moves the new archive into place. If
+        the check fails, the archive is not saved.
         """
         if self._zipfile is None:
             return
         self._finalizer.detach()
         try:
+            if self.mode == "w":
+                self._check_single_record()
             self._zipfile.close()
             if self._tmp_path is not None:
                 os.chmod(self._tmp_path, _new_file_mode(self.path))
                 os.replace(self._tmp_path, self.path)
         except BaseException:
-            _discard(None, self._tmp_path)
+            _discard(self._zipfile, self._tmp_path)
             raise
         finally:
             self._zipfile = None
@@ -266,21 +315,32 @@ class WFDBArchive:
                 f"Could not find '{file_name}' in archive '{self.path}'"
             ) from None
 
-    def _check_new_file(self, file_name):
+    def _register_file(self, file_name, digest):
         """
-        Check that a file can be added to an archive opened for writing.
+        Record that a file is about to be written. Return False if the
+        same content was already written under that name.
         """
-        self._require_mode("w")
-        if self.exists(file_name):
-            raise ValueError(f"'{file_name}' was already written to the archive")
-        if file_name.endswith(".hea"):
-            headers = [n for n in self.namelist() if n.endswith(".hea")]
-            if headers:
+        if file_name in self._digests:
+            if self._digests[file_name] != digest:
                 raise ValueError(
-                    f"Cannot add '{file_name}' to '{self.path}': an archive "
-                    f"holds a single record, and it already contains the "
-                    f"header '{headers[0]}'"
+                    f"'{file_name}' was already written to the archive "
+                    "with different content"
                 )
+            return False
+        self._digests[file_name] = digest
+        return True
+
+    def _check_single_record(self):
+        """
+        Check that the header files written make up a single record: one
+        header, or a multi-segment header and the segments it lists.
+        """
+        if len(self._headers) > 1 and _main_header(self._headers) is None:
+            raise ValueError(
+                f"Cannot save '{self.path}': an archive holds a single "
+                f"record, but the header files {sorted(self._headers)} are "
+                "not one multi-segment record and its segments"
+            )
 
     def _require_mode(self, mode):
         if self.mode != mode:
@@ -289,6 +349,57 @@ class WFDBArchive:
                 f"Archive '{self.path}' was opened in mode '{self.mode}' "
                 f"and cannot be {action}"
             )
+
+
+def _segment_header_names(header_content):
+    """
+    Return the names of the header files of the segments listed in a
+    multi-segment header, including the layout header. A single-segment
+    header lists no segments.
+    """
+    header_lines, _ = header.parse_header_content(header_content)
+    if not header_lines or "/" not in header_lines[0].split()[0]:
+        return set()
+    names = {line.split()[0] for line in header_lines[1:]}
+    names.discard("~")
+    return {name + ".hea" for name in names}
+
+
+def _main_header(headers):
+    """
+    Find the main header of a record, given the content of all its header
+    files.
+
+    Parameters
+    ----------
+    headers : dict
+        The content of each header file, keyed by file name.
+
+    Returns
+    -------
+    str or None
+        The name of the only header, or of the multi-segment header that
+        lists all the other headers as its segments. None if there is no
+        such header.
+
+    """
+    if len(headers) == 1:
+        return next(iter(headers))
+    for name, content in headers.items():
+        if set(headers) - {name} <= _segment_header_names(content):
+            return name
+    return None
+
+
+def _file_digest(path):
+    """
+    Return the SHA-256 digest of a file, reading it in chunks.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def _discard(zip_file, tmp_path):
